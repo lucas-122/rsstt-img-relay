@@ -20,16 +20,16 @@ const config = {
     sematextToken: "00000000-0000-0000-0000-000000000000",
     // 是否丢弃请求中的 Referer，在目标网站应用防盗链时有用
     dropReferer: true,
-    // weibo workarounds
-    weiboCDN: [".weibocdn.com", ".sinaimg.cn"],
-    weiboReferer: "https://weibo.com/",
-    // sspai workarounds
-    sspaiCDN: [".sspai.com"],
-    sspaiReferer: "https://sspai.com/",
+    // CDN 防盗链列表
+    cdnList: [
+        { hosts: [".weibocdn.com", ".sinaimg.cn"], referer: "https://weibo.com/" },
+        { hosts: [".sspai.com"], referer: "https://sspai.com/" },
+        { hosts: [".bilibili.com", ".hdslb.com"], referer: "https://www.bilibili.com/" },
+        { hosts: [".douyin.com", ".iesdouyin.com"], referer: "https://www.douyin.com/" },
+        { hosts: [".coolapk.com"], referer: "https://www.coolapk.com/" }
+    ],
     // 黑名单，URL 中含有任何一个关键字都会被阻断
-    // blockList: [".m3u8", ".ts", ".acc", ".m4s", "photocall.tv", "googlevideo.com", "liveradio.ie"],
     blockList: [],
-    typeList: ["image", "video", "audio", "application", "font", "model"],
 };
 
 /**
@@ -53,7 +53,6 @@ async function fetchHandler(request, env, ctx) {
     ctx.passThroughOnException();
     setConfig(env);
 
-    //请求头部、返回对象
     let reqHeaders = new Headers(request.headers),
         outBody, outStatus = 200, outStatusText = 'OK', outCt = null, outHeaders = new Headers({
             "Access-Control-Allow-Origin": "*",
@@ -64,14 +63,11 @@ async function fetchHandler(request, env, ctx) {
     try {
         const urlMatch = request.url.match(RegExp(config.URLRegExp));
         config.selfURL = urlMatch[1];
-        let url = urlMatch[2];
+        let url = decodeURIComponent(urlMatch[2]);
 
-        url = decodeURIComponent(url);
-
-        //需要忽略的代理
-        if (request.method == "OPTIONS" || url.length < 3 || url.indexOf('.') == -1 || url == "favicon.ico" || url == "robots.txt") {
-            //输出提示
-            const invalid = !(request.method == "OPTIONS" || url.length === 0)
+        //忽略 OPTIONS 或特殊路径
+        if (request.method === "OPTIONS" || url.length < 3 || url.indexOf('.') === -1 || url === "favicon.ico" || url === "robots.txt") {
+            const invalid = !(request.method === "OPTIONS" || url.length === 0)
             outBody = JSON.stringify({
                 code: invalid ? 400 : 0,
                 usage: 'Host/{URL}',
@@ -80,7 +76,7 @@ async function fetchHandler(request, env, ctx) {
             outCt = "application/json";
             outStatus = invalid ? 400 : 200;
         }
-        //阻断
+        //阻断黑名单 URL
         else if (blockUrl(url)) {
             outBody = JSON.stringify({
                 code: 403,
@@ -92,35 +88,29 @@ async function fetchHandler(request, env, ctx) {
         else {
             url = fixUrl(url);
 
-            //构建 fetch 参数
-            let fp = {
-                method: request.method,
-                headers: {}
-            }
-
-            //保留头部其它信息
+            let fp = { method: request.method, headers: {} };
             const dropHeaders = ['content-length', 'content-type', 'host'];
             if (config.dropReferer) dropHeaders.push('referer');
-            let he = reqHeaders.entries();
-            for (let h of he) {
-                const key = h[0], value = h[1];
+
+            for (let [key, value] of reqHeaders.entries()) {
                 if (!dropHeaders.includes(key)) {
                     fp.headers[key] = value;
                 }
             }
+
+            // 防盗链处理
             if (config.dropReferer) {
                 const urlObj = new URL(url);
-                if (config.weiboCDN.some(x => urlObj.host.endsWith(x))) {
-                    // apply weibo workarounds
-                    fp.headers['referer'] = config.weiboReferer;
-                } else if (config.sspaiCDN.some(x => urlObj.host.endsWith(x))) {
-                    // apply sspai workarounds
-                    fp.headers['referer'] = config.sspaiReferer;
+                for (const cdn of config.cdnList) {
+                    if (cdn.hosts.some(h => urlObj.host.endsWith(h))) {
+                        fp.headers['referer'] = cdn.referer;
+                        break;
+                    }
                 }
             }
 
             // 是否带 body
-            if (["POST", "PUT", "PATCH", "DELETE"].indexOf(request.method) >= 0) {
+            if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
                 const ct = (reqHeaders.get('content-type') || "").toLowerCase();
                 if (ct.includes('application/json')) {
                     fp.body = JSON.stringify(await request.json());
@@ -134,26 +124,16 @@ async function fetchHandler(request, env, ctx) {
             }
 
             // 发起 fetch
-            let fr = (await fetch(url, fp));
+            let fr = await fetch(url, fp);
             outCt = fr.headers.get('content-type');
-            // 阻断
-            if (blockType(outCt)) {
-                outBody = JSON.stringify({
-                    code: 415,
-                    msg: 'The keyword "' + config.typeList.join(' , ') + '" was whitelisted by the operator of this proxy, but got "' + outCt + '".'
-                });
-                outCt = "application/json";
-                outStatus = 415;
-            }
-            else {
-                outStatus = fr.status;
-                outStatusText = fr.statusText;
-                outBody = fr.body;
-                const overrideHeaders = new Set(outHeaders.keys())
-                for (let h of fr.headers.entries()) {
-                    if (!overrideHeaders.has(h[0]))
-                        outHeaders.set(h[0], h[1]);
-                }
+            outStatus = fr.status;
+            outStatusText = fr.statusText;
+            outBody = fr.body;
+
+            const overrideHeaders = new Set(outHeaders.keys());
+            for (let [k, v] of fr.headers.entries()) {
+                if (!overrideHeaders.has(k))
+                    outHeaders.set(k, v);
             }
         }
     } catch (err) {
@@ -165,69 +145,44 @@ async function fetchHandler(request, env, ctx) {
         outStatus = 500;
     }
 
-    //设置类型
-    if (outCt && outCt != "") {
-        outHeaders.set("content-type", outCt);
-    }
+    if (outCt) outHeaders.set("content-type", outCt);
+    if (outStatus < 400) outHeaders.set("cache-control", "public, max-age=604800");
 
-    if (outStatus < 400)
-        outHeaders.set("cache-control", "public, max-age=604800");
-
-    let response = new Response(outBody, {
+    const response = new Response(outBody, {
         status: outStatus,
         statusText: outStatusText,
         headers: outHeaders
-    })
+    });
 
-    //日志接口
-    if (config.sematextToken != "00000000-0000-0000-0000-000000000000") {
+    if (config.sematextToken !== "00000000-0000-0000-0000-000000000000") {
         sematext.add(ctx, request, response);
     }
 
     return response;
-
-    // return new Response('OK', { status: 200 })
 }
 
 // 补齐 url
 function fixUrl(url) {
-    if (url.includes("://")) {
-        return url;
-    } else if (url.includes(':/')) {
-        return url.replace(':/', '://');
-    } else {
-        return "http://" + url;
-    }
+    if (url.includes("://")) return url;
+    if (url.includes(':/')) return url.replace(':/', '://');
+    return "http://" + url;
 }
 
-// 阻断 url
+// 阻断黑名单 url
 function blockUrl(url) {
     url = url.toLowerCase();
-    let len = config.blockList.filter(x => url.includes(x)).length;
-    return len != 0;
-}
-// 阻断 type
-function blockType(type) {
-    type = type.toLowerCase();
-    let len = config.typeList.filter(x => type.includes(x)).length;
-    return len == 0;
+    return config.blockList.some(x => url.includes(x));
 }
 
 /**
  * 日志
  */
 const sematext = {
-
-    /**
-     * 构建发送主体
-     * @param {any} request
-     * @param {any} response
-     */
     buildBody: (request, response) => {
-        const hua = request.headers.get("user-agent")
-        const hip = request.headers.get("cf-connecting-ip")
-        const hrf = request.headers.get("referer")
-        const url = new URL(request.url)
+        const hua = request.headers.get("user-agent");
+        const hip = request.headers.get("cf-connecting-ip");
+        const hrf = request.headers.get("referer");
+        const url = new URL(request.url);
 
         const body = {
             method: request.method,
@@ -240,10 +195,9 @@ const sematext = {
             proxyHost: null,
         }
 
-        if (body.path.includes(".") && body.path != "/" && !body.path.includes("favicon.ico")) {
+        if (body.path.includes(".") && body.path !== "/" && !body.path.includes("favicon.ico")) {
             try {
                 let purl = fixUrl(decodeURIComponent(body.path.substring(1)));
-
                 body.path = purl;
                 body.proxyHost = new URL(purl).host;
             } catch { }
@@ -255,17 +209,10 @@ const sematext = {
         }
     },
 
-    /**
-     * 添加
-     * @param {any} event
-     * @param {any} request
-     * @param {any} response
-     */
     add: (event, request, response) => {
         let url = `https://logsene-receiver.sematext.com/${config.sematextToken}/example/`;
         const body = sematext.buildBody(request, response);
-
-        event.waitUntil(fetch(url, body))
+        event.waitUntil(fetch(url, body));
     }
 };
 
